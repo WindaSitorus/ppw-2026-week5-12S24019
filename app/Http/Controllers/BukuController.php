@@ -11,10 +11,38 @@ use Illuminate\Database\QueryException;
 
 class BukuController extends Controller
 {
-    public function index()
+    // --- FITUR BARU: INDEX DENGAN STATISTIK & PENCARIAN ---
+    public function index(Request $request)
     {
-        $bukus = Buku::with('kategori')->latest()->paginate(10);
-        return view('buku.index', compact('bukus'));
+        // Menyimpan riwayat pencarian terakhir ke Session (Syarat Modul)
+        if ($request->filled('search')) {
+            session(['last_buku_search' => $request->search]);
+        }
+
+        // 1. Eloquent withCount & Filter Pencarian Dinamis
+        $bukus = Buku::with('kategori')
+            ->withCount('peminjamans')
+            ->when($request->search, function ($query, $search) {
+                return $query->where('judul', 'like', "%{$search}%")
+                             ->orWhere('penulis', 'like', "%{$search}%")
+                             ->orWhere('isbn', 'like', "%{$search}%")
+                             ->orWhereHas('kategori', function($q) use ($search) {
+                                 $q->where('nama_kategori', 'like', "%{$search}%");
+                             });
+            })
+            ->latest()
+            ->paginate(10)
+            ->withQueryString(); // Mempertahankan parameter pencarian di pagination
+
+        // 2. Query Builder (DB::table) untuk Analitik Perpustakaan
+        $stats = [
+            'total_buku'         => DB::table('bukus')->count(),
+            'total_stok'         => DB::table('bukus')->sum('stok'),
+            'sedang_dipinjam'    => DB::table('peminjamans')->where('status', 'dipinjam')->count(),
+            'total_dikembalikan' => DB::table('peminjamans')->where('status', 'dikembalikan')->count(),
+        ];
+
+        return view('buku.index', compact('bukus', 'stats'));
     }
 
     public function create()
@@ -31,10 +59,10 @@ class BukuController extends Controller
             'kategori_id' => 'required|exists:kategoris,id',
         ]);
         
-        // Simpan data (jika ada logika simpan buku sebelumnya, sesuaikan di sini)
+        // Simpan data
     }
 
-    // --- BAGIAN BARU: FITUR PINJAM BUKU ---
+    // --- FITUR PINJAM BUKU ---
     public function pinjam(Request $request, $id)
     {
         $validated = $request->validate([
@@ -43,17 +71,13 @@ class BukuController extends Controller
         ]);
 
         try {
-            // Membungkus proses dalam DB::transaction untuk memenuhi syarat ACID
             DB::transaction(function () use ($validated, $id) {
-                // Kunci baris buku menggunakan lockForUpdate() agar aman dari Race Condition
                 $buku = Buku::where('id', $id)->lockForUpdate()->firstOrFail();
 
-                // Tolak dan hentikan transaksi jika stok buku 0
                 if ($buku->stok < 1) {
                     throw new \RuntimeException("Stok buku habis!");
                 }
 
-                // Cek apakah NIM tersebut masih meminjam buku ini dan belum dikembalikan
                 $sedangDipinjam = Peminjaman::where('buku_id', $id)
                     ->where('nim_peminjam', $validated['nim_peminjam'])
                     ->where('status', 'dipinjam')
@@ -63,10 +87,8 @@ class BukuController extends Controller
                     throw new \RuntimeException("NIM ini sedang meminjam buku ini dan belum dikembalikan.");
                 }
 
-                // Kurangi stok buku
                 $buku->decrement('stok');
 
-                // Catat ke tabel peminjamans
                 Peminjaman::create([
                     'kode_pinjam' => 'PJ-' . strtoupper(uniqid()),
                     'buku_id' => $buku->id,
@@ -83,31 +105,27 @@ class BukuController extends Controller
         } catch (\RuntimeException $e) {
             return back()->with('error', $e->getMessage());
         } catch (QueryException $e) {
-            // Tangkap dan rekam error database sesuai instruksi
             Log::error('[DB EXCEPTION] Pinjam: ' . $e->getMessage());
             return back()->with('error', 'Terjadi kesalahan sistem database.');
         }
     }
 
-    // --- BAGIAN BARU: FITUR KEMBALI BUKU ---
+    // --- FITUR KEMBALI BUKU ---
     public function kembali($id)
     {
         try {
             DB::transaction(function () use ($id) {
-                // Kunci baris peminjaman
                 $peminjaman = Peminjaman::where('id', $id)->lockForUpdate()->firstOrFail();
 
                 if ($peminjaman->status === 'dikembalikan') {
                     throw new \RuntimeException("Buku sudah dikembalikan sebelumnya.");
                 }
 
-                // Ubah status dan catat tanggal kembali
                 $peminjaman->update([
                     'status' => 'dikembalikan',
                     'tanggal_kembali' => now()->toDateString(),
                 ]);
 
-                // Kunci baris buku dan kembalikan stoknya
                 $buku = Buku::where('id', $peminjaman->buku_id)->lockForUpdate()->firstOrFail();
                 $buku->increment('stok');
             }, 3);
